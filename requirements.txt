@@ -3,3 +3,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 websocket-client
+wasmer
+wasmer-compiler-cranelift

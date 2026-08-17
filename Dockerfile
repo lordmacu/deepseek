@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# Node.js 18 (repos de Debian Bookworm), ffmpeg, libopus
+# ffmpeg + libopus (ASR); no Node.js needed — PoW solved via wasmer (Python)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        nodejs \
         ffmpeg \
         libopus0 \
     && rm -rf /var/lib/apt/lists/*
@@ -13,8 +12,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App — sha3_wasm_bg.wasm es requerido por pow_solver.mjs en runtime
-COPY deepseek pow_solver.mjs sha3_wasm_bg.wasm server.py ./
+# App — sha3_wasm_bg.wasm cargado por pow_solver.py en runtime
+COPY deepseek pow_solver.py sha3_wasm_bg.wasm server.py ./
 
 RUN chmod +x /app/deepseek
 

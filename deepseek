@@ -13,7 +13,7 @@ Uso:
   deepseek --no-training            # opt-out de datos de entrenamiento
   deepseek --logout                 # borra token guardado
 
-Dependencias: requests, node (para WASM PoW), ffmpeg + libopus (para --asr)
+Dependencias: requests, wasmer, wasmer-compiler-cranelift, ffmpeg + libopus (para --asr)
 """
 
 import os, sys, json, uuid, subprocess, base64, argparse, getpass, time, io, mimetypes
@@ -21,7 +21,7 @@ import ctypes, struct, threading, tempfile
 import requests
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-POW_SOLVER   = os.path.join(SCRIPT_DIR, "pow_solver.mjs")
+POW_SOLVER   = os.path.join(SCRIPT_DIR, "pow_solver.py")
 ENV_FILE     = os.path.join(SCRIPT_DIR, ".env")
 TOKEN_FILE   = os.path.expanduser("~/.deepseek_token")
 SESSION_FILE = os.path.expanduser("~/.deepseek_session")
@@ -223,7 +223,7 @@ def get_pow_challenge(auth_headers, target_path="/api/v0/chat/completion"):
 
 def solve_pow(challenge):
     result = subprocess.run(
-        ["node", POW_SOLVER],
+        [sys.executable, POW_SOLVER],
         input=json.dumps(challenge).encode(),
         capture_output=True, timeout=60,
     )

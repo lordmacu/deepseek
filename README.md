@@ -7,8 +7,8 @@ CLI de terminal y servidor OpenAI-compatible para DeepSeek Chat, reverse-enginee
 ```
 deepseek              CLI principal
 server.py             API OpenAI-compatible (FastAPI)
-pow_solver.mjs        Solver del challenge Proof-of-Work (WASM SHA3)
-sha3_wasm_bg.wasm     WASM compilado requerido por pow_solver.mjs
+pow_solver.py         Solver del challenge Proof-of-Work (ejecuta el WASM desde Python)
+sha3_wasm_bg.wasm     WASM con el algoritmo hash propio de DeepSeek
 .env                  Credenciales y token cacheado (nunca entra a la imagen Docker)
 Dockerfile
 docker-compose.yml
@@ -175,10 +175,10 @@ El servidor guarda el token automáticamente. `credentials_updated: true` indica
 
 ```bash
 # Dependencias Python
-pip install requests websocket-client
+pip install requests websocket-client wasmer wasmer-compiler-cranelift
 
 # Dependencias del sistema (macOS)
-brew install node ffmpeg opus
+brew install ffmpeg opus
 
 chmod +x deepseek
 ln -s $(pwd)/deepseek /usr/local/bin/deepseek   # opcional: agregar al PATH
@@ -316,7 +316,7 @@ Model:     deepseek-chat  |  deepseek-reasoner  |  deepseek-vision
 
 ### Proof-of-Work
 
-DeepSeek protege `/chat/completion` y `/file/upload_file` con un sistema PoW propio (`DeepSeekHashV1`): el servidor emite un challenge, el cliente resuelve un hash SHA3 con dificultad variable. `pow_solver.mjs` lo resuelve usando el mismo WASM que la app Android (`sha3_wasm_bg.wasm`).
+DeepSeek protege `/chat/completion` y `/file/upload_file` con un sistema PoW propio (`DeepSeekHashV1`): el servidor emite un challenge, el cliente busca el nonce que produce ese hash exacto con su función personalizada. `pow_solver.py` ejecuta el WASM original (`sha3_wasm_bg.wasm`) usando `wasmer` desde Python — no se necesita Node.js.
 
 ### ASR (voz → texto)
 
