@@ -1,0 +1,9 @@
+.env
+*.token
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+decompiled_apktool/
+decompiled_jadx/
+deepseek.apk

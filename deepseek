@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""
+deepseek — CLI para chatear con DeepSeek desde la terminal.
+
+Uso:
+  deepseek "¿Cuál es la capital de Francia?"
+  deepseek                          # lee el prompt de stdin
+  deepseek -s                       # nueva sesión (no reutiliza la anterior)
+  deepseek --model r1               # usar DeepSeek-R1 (thinking)
+  deepseek --image foto.jpg "¿Qué ves en esta imagen?"
+  deepseek --asr nota.mp3           # transcribe audio y envía como prompt
+  deepseek --asr nota.mp3 "resume" # transcribe + agrega texto extra al prompt
+  deepseek --no-training            # opt-out de datos de entrenamiento
+  deepseek --logout                 # borra token guardado
+
+Dependencias: requests, node (para WASM PoW), ffmpeg + libopus (para --asr)
+"""
+
+import os, sys, json, uuid, subprocess, base64, argparse, getpass, time, io, mimetypes
+import ctypes, struct, threading, tempfile
+import requests
+
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+POW_SOLVER   = os.path.join(SCRIPT_DIR, "pow_solver.mjs")
+ENV_FILE     = os.path.join(SCRIPT_DIR, ".env")
+TOKEN_FILE   = os.path.expanduser("~/.deepseek_token")
+SESSION_FILE = os.path.expanduser("~/.deepseek_session")
+STATE_FILE   = os.path.expanduser("~/.deepseek_state")
+BASE         = "https://chat.deepseek.com"
+HEADERS      = {
+    "Content-Type":       "application/json",
+    "User-Agent":         "DeepSeek/2.3.6 (com.deepseek.chat; Android)",
+    "x-client-platform":  "android",
+    "x-client-version":   "2.3.6",
+    "x-client-bundle-id": "com.deepseek.chat",
+}
+
+
+# ── .env helpers ───────────────────────────────────────────────────────────
+
+def _read_env() -> dict:
+    """Parse KEY=VALUE pairs from .env (no external deps)."""
+    result = {}
+    if not os.path.exists(ENV_FILE):
+        return result
+    for line in open(ENV_FILE):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        result[k.strip()] = v.strip()
+    return result
+
+
+def _write_env_key(key: str, value: str):
+    """Update or append a single KEY=VALUE in .env."""
+    lines = []
+    found = False
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE):
+            stripped = line.strip()
+            if stripped.startswith(key + "=") or stripped == key + "=":
+                lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(ENV_FILE, "w") as f:
+        f.writelines(lines)
+    os.chmod(ENV_FILE, 0o600)
+
+
+def _env_creds():
+    """Return (email, password) from env-vars or .env file, or (None, None)."""
+    env = _read_env()
+    # Env vars (inyectadas por Docker) tienen prioridad sobre el archivo .env
+    email    = os.environ.get("DEEPSEEK_EMAIL")    or env.get("EMAIL")
+    password = os.environ.get("DEEPSEEK_PASSWORD") or env.get("PASSWORD")
+    return email or None, password or None
+
+
+# ── Auth ───────────────────────────────────────────────────────────────────
+
+def load_token():
+    # Prioridad: env var > .env DEEPSEEK_TOKEN > ~/.deepseek_token
+    if os.environ.get("DEEPSEEK_TOKEN"):
+        return os.environ["DEEPSEEK_TOKEN"]
+    env = _read_env()
+    if env.get("DEEPSEEK_TOKEN"):
+        return env["DEEPSEEK_TOKEN"]
+    if os.path.exists(TOKEN_FILE):
+        t = open(TOKEN_FILE).read().strip()
+        if t:
+            return t
+    return None
+
+
+def save_token(token: str):
+    """Persist token to ~/.deepseek_token AND .env DEEPSEEK_TOKEN."""
+    with open(TOKEN_FILE, "w") as f:
+        f.write(token)
+    os.chmod(TOKEN_FILE, 0o600)
+    _write_env_key("DEEPSEEK_TOKEN", token)
+
+
+def _token_valid(token: str) -> bool:
+    try:
+        r = requests.get(BASE + "/api/v0/users/current",
+            headers={**HEADERS, "Authorization": f"Bearer {token}"}, timeout=10)
+        return r.status_code == 200 and r.json().get("code") == 0
+    except Exception:
+        return False
+
+
+def login(email: str, password: str) -> str:
+    resp = requests.post(BASE + "/api/v0/users/login", headers=HEADERS, json={
+        "email":     email,
+        "password":  password,
+        "device_id": str(uuid.uuid4()),
+        "os":        "android",
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise SystemExit(f"Login failed: {data.get('msg', data)}")
+    return data["data"]["biz_data"]["user"]["token"]
+
+
+def _auto_login():
+    """Login using .env / environment credentials. Returns token or None."""
+    email, password = _env_creds()
+    if not email or not password:
+        return None
+    print("[*] Auto-login con credenciales de .env...", file=sys.stderr)
+    try:
+        token = login(email, password)
+        save_token(token)
+        print("[+] Token guardado.", file=sys.stderr)
+        return token
+    except Exception as e:
+        print(f"[!] Auto-login falló: {e}", file=sys.stderr)
+        return None
+
+
+def get_token() -> str:
+    """
+    Return a valid DeepSeek token.
+    Order: cached token (if valid) → auto-login from .env → interactive login.
+    """
+    token = load_token()
+    if token and _token_valid(token):
+        return token
+
+    # Cached token expired or missing → try auto-login
+    token = _auto_login()
+    if token:
+        return token
+
+    # Last resort: interactive
+    print("DeepSeek login", file=sys.stderr)
+    email    = input("Email: ")
+    password = getpass.getpass("Password: ")
+    token    = login(email, password)
+    save_token(token)
+    return token
+
+
+def refresh_token() -> str:
+    """Force re-login (call when a request returns 401)."""
+    print("[*] Token expirado, re-autenticando...", file=sys.stderr)
+    token = _auto_login()
+    if token:
+        return token
+    print("DeepSeek login", file=sys.stderr)
+    email    = input("Email: ")
+    password = getpass.getpass("Password: ")
+    token    = login(email, password)
+    save_token(token)
+    return token
+
+
+# ── Session ────────────────────────────────────────────────────────────────
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            return json.load(open(STATE_FILE))
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w"))
+
+
+def create_session(auth_headers):
+    resp = requests.post(BASE + "/api/v0/chat_session/create",
+        headers=auth_headers, json={}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["data"]["biz_data"]["chat_session"]["id"]
+
+
+def get_state(auth_headers, new_session=False, model_type=None):
+    if not new_session:
+        state = load_state()
+        if state.get("session_id"):
+            return state["session_id"], state.get("parent_message_id"), state.get("model_type", "default")
+    sid = create_session(auth_headers)
+    return sid, None, model_type or "default"
+
+
+# ── PoW ────────────────────────────────────────────────────────────────────
+
+def get_pow_challenge(auth_headers, target_path="/api/v0/chat/completion"):
+    resp = requests.post(BASE + "/api/v0/chat/create_pow_challenge",
+        headers=auth_headers,
+        json={"target_path": target_path}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["data"]["biz_data"]["challenge"]
+
+
+def solve_pow(challenge):
+    result = subprocess.run(
+        ["node", POW_SOLVER],
+        input=json.dumps(challenge).encode(),
+        capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"PoW solver error: {result.stderr.decode()}")
+    return json.loads(result.stdout)["nonce"]
+
+
+def make_pow_header(challenge, nonce):
+    payload = {
+        "algorithm":   challenge["algorithm"],
+        "challenge":   challenge["challenge"],
+        "salt":        challenge["salt"],
+        "signature":   challenge["signature"],
+        "answer":      nonce,
+        "target_path": challenge["target_path"],
+    }
+    return base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+
+
+# ── File upload ─────────────────────────────────────────────────────────────
+
+def upload_file(auth_headers, file_path, model_type=None):
+    """Upload a file (image or document). Returns file_id."""
+    print(f"[*] Subiendo {os.path.basename(file_path)}...", file=sys.stderr)
+
+    ch = get_pow_challenge(auth_headers, target_path="/api/v0/file/upload_file")
+    nonce = solve_pow(ch)
+    upload_headers = {k: v for k, v in auth_headers.items() if k != "Content-Type"}
+    upload_headers["X-DS-PoW-Response"] = make_pow_header(ch, nonce)
+
+    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    # Required by APK: x-file-size and x-model-type tell the server how to process the file
+    upload_headers["x-file-size"] = str(len(data))
+    upload_headers["X-Thinking-Enabled"] = "0"
+    if model_type:
+        upload_headers["x-model-type"] = model_type  # "vision" → image processing
+
+    resp = requests.post(BASE + "/api/v0/file/upload_file",
+        headers=upload_headers,
+        files={"file": (os.path.basename(file_path), io.BytesIO(data), mime)},
+        timeout=60)
+
+    d = resp.json()
+    if d.get("code") != 0 or d.get("data", {}).get("biz_code") != 0:
+        raise SystemExit(f"Upload error: {d}")
+
+    file_id = d["data"]["biz_data"]["id"]
+    print(f"[+] Archivo subido: {file_id}", file=sys.stderr)
+    return file_id
+
+
+def wait_for_file(auth_headers, file_id, timeout=30):
+    """Poll fetch_files until status != PENDING. Returns final status."""
+    headers = {**auth_headers}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = requests.get(BASE + "/api/v0/file/fetch_files",
+            headers=headers, params={"file_ids": file_id}, timeout=10)
+        files = resp.json().get("data", {}).get("biz_data", {}).get("files", [])
+        if files and files[0].get("status") != "PENDING":
+            status = files[0]["status"]
+            if status in ("ERROR", "CONTENT_FILTER"):
+                raise SystemExit(f"[!] Archivo rechazado: {status}")
+            return status  # COMPLETE, CONTENT_EMPTY (imagen sin texto) = OK
+        time.sleep(1)
+    raise SystemExit("[!] Timeout esperando procesamiento del archivo")
+
+
+# ── ASR ────────────────────────────────────────────────────────────────────
+
+_OPUS_PATHS = [
+    "/opt/homebrew/lib/libopus.dylib",
+    "/opt/homebrew/opt/opus/lib/libopus.dylib",
+    "/usr/local/lib/libopus.dylib",
+    "/usr/lib/libopus.so.0",
+    "libopus.so.0",
+    "libopus.dylib",
+]
+
+
+def _load_opus():
+    from ctypes.util import find_library
+    auto = find_library("opus")  # works on Linux with libopus0 installed
+    candidates = ([auto] if auto else []) + _OPUS_PATHS
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            lib = ctypes.cdll.LoadLibrary(path)
+            lib.opus_encoder_create.restype = ctypes.c_void_p
+            lib.opus_encoder_create.argtypes = [
+                ctypes.c_int32, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.opus_encode.restype = ctypes.c_int32
+            lib.opus_encode.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32,
+            ]
+            lib.opus_encoder_destroy.restype = None
+            lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+            return lib
+        except OSError:
+            continue
+    return None
+
+
+def asr_transcribe(auth_headers, audio_path):
+    """Transcribe audio via DeepSeek ASR WebSocket. Returns (transcription, audio_id)."""
+    try:
+        import websocket
+    except ImportError:
+        raise SystemExit("[!] Instala websocket-client: pip install websocket-client")
+
+    opus = _load_opus()
+    if not opus:
+        raise SystemExit(
+            "[!] libopus no encontrado. Instala: brew install opus\n"
+            "    Rutas buscadas:\n" + "\n".join(f"      {p}" for p in _OPUS_PATHS)
+        )
+
+    print(f"[*] Convirtiendo {os.path.basename(audio_path)}...", file=sys.stderr)
+    with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as tf:
+        pcm_path = tf.name
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path,
+             "-ar", "16000", "-ac", "1", "-f", "s16le", pcm_path],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                f"[!] ffmpeg error:\n{result.stderr.decode()[:400]}\n"
+                "    Instala ffmpeg: brew install ffmpeg"
+            )
+        with open(pcm_path, "rb") as f:
+            pcm_data = f.read()
+    finally:
+        try:
+            os.unlink(pcm_path)
+        except OSError:
+            pass
+
+    if len(pcm_data) < 640:
+        raise SystemExit("[!] Audio demasiado corto (< 20ms)")
+
+    FRAME_SIZE = 320
+    MAX_FRAME_BYTES = 1275
+    OPUS_APPLICATION_VOIP = 2048
+
+    err = ctypes.c_int(0)
+    encoder = opus.opus_encoder_create(16000, 1, OPUS_APPLICATION_VOIP, ctypes.byref(err))
+    if not encoder or err.value != 0:
+        raise SystemExit(f"[!] opus_encoder_create falló: error={err.value}")
+
+    opus_frames = []
+    try:
+        for i in range(0, len(pcm_data) - 639, 640):
+            pcm_array = (ctypes.c_int16 * FRAME_SIZE)(
+                *struct.unpack(f"<{FRAME_SIZE}h", pcm_data[i:i + 640])
+            )
+            out_buf = (ctypes.c_uint8 * MAX_FRAME_BYTES)()
+            n = opus.opus_encode(encoder, pcm_array, FRAME_SIZE, out_buf, MAX_FRAME_BYTES)
+            if n > 0:
+                opus_frames.append(bytes(out_buf[:n]))
+    finally:
+        opus.opus_encoder_destroy(encoder)
+
+    print(f"[*] {len(opus_frames)} frames Opus, conectando ASR...", file=sys.stderr)
+
+    transcription = None
+    audio_id = None
+    done = threading.Event()
+    ws_error = []
+
+    ws_headers = {k: v for k, v in auth_headers.items() if k.lower() != "content-type"}
+
+    def on_message(ws, message):
+        nonlocal transcription, audio_id
+        try:
+            d = json.loads(message)
+        except Exception:
+            return
+        t = d.get("type")
+        if t == "start":
+            audio_id = d.get("audio_id")
+            def _send():
+                for frame in opus_frames:
+                    ws.send(frame, websocket.ABNF.OPCODE_BINARY)
+                    time.sleep(0.018)
+                ws.send(json.dumps({"type": "finish", "finish_reason": "done"}))
+            threading.Thread(target=_send, daemon=True).start()
+        elif t == "result":
+            transcription = d.get("result", "")
+        elif t == "end":
+            code = d.get("code", -1)
+            if code != 0 and not transcription:
+                ws_error.append(f"ASR error code={code}: {d.get('msg', '')}")
+            done.set()
+            ws.close()
+
+    def on_error(ws, error):
+        ws_error.append(str(error))
+        done.set()
+
+    ws_app = websocket.WebSocketApp(
+        "wss://chat.deepseek.com/api/v0/asr/ws?format=opus",
+        header=ws_headers,
+        on_message=on_message,
+        on_error=on_error,
+    )
+    threading.Thread(
+        target=lambda: ws_app.run_forever(ping_interval=20),
+        daemon=True,
+    ).start()
+    done.wait(timeout=60)
+
+    if ws_error:
+        raise SystemExit(f"[!] ASR falló: {ws_error[0]}")
+    if not transcription:
+        raise SystemExit("[!] ASR sin resultado (audio ininteligible o silencio)")
+
+    return transcription, audio_id
+
+
+# ── Settings ───────────────────────────────────────────────────────────────
+
+def set_training(auth_headers, allowed: bool):
+    resp = requests.post(BASE + "/api/v0/users/update_settings",
+        headers=auth_headers,
+        json={"training_allowed": allowed},
+        timeout=10)
+    d = resp.json()
+    if d.get("code") == 0:
+        estado = "activado" if allowed else "desactivado"
+        print(f"[+] Entrenamiento {estado}.", file=sys.stderr)
+    else:
+        print(f"[!] Error: {d}", file=sys.stderr)
+
+
+# ── Chat ───────────────────────────────────────────────────────────────────
+
+def chat(auth_headers, session_id, parent_message_id, prompt,
+         thinking=False, search=False, model_type=None, file_ids=None, audio_id=None):
+    challenge = get_pow_challenge(auth_headers)
+    nonce     = solve_pow(challenge)
+    headers   = {**auth_headers, "X-DS-PoW-Response": make_pow_header(challenge, nonce)}
+
+    payload = {
+        "chat_session_id":   session_id,
+        "parent_message_id": parent_message_id,
+        "prompt":            prompt,
+        "ref_file_ids":      file_ids or [],
+        "search_enabled":    search,
+        "thinking_enabled":  thinking,
+        "stream":            True,
+    }
+    if parent_message_id is None and model_type:
+        payload["model_type"] = model_type
+    if audio_id:
+        payload["audio_id"] = audio_id
+
+    resp = requests.post(
+        BASE + "/api/v0/chat/completion",
+        headers=headers,
+        json=payload,
+        stream=True, timeout=120,
+    )
+
+    if resp.status_code != 200:
+        raise SystemExit(f"Chat error {resp.status_code}: {resp.text[:300]}")
+
+    in_think        = False
+    in_content      = False
+    thinking_done   = False
+    response_msg_id = None
+
+    for line in resp.iter_lines():
+        raw = line.decode() if isinstance(line, bytes) else line
+        if not raw.startswith("data:"):
+            continue
+        try:
+            evt = json.loads(raw[5:])
+        except Exception:
+            continue
+
+        path = evt.get("p", "")
+        op   = evt.get("o", "")
+        val  = evt.get("v", "")
+
+        if "response_message_id" in evt:
+            response_msg_id = evt["response_message_id"]
+            continue
+
+        if path == "response/status" and val == "FINISHED":
+            break
+
+        if not path and isinstance(val, dict) and "response" in val:
+            frags = val["response"].get("fragments", [])
+            for frag in frags:
+                ftype   = frag.get("type", "")
+                content = frag.get("content", "")
+                if not content:
+                    continue
+                if ftype in ("THINK", "THINKING"):
+                    in_think = True
+                    sys.stderr.write(f"\033[2m{content}\033[0m")
+                    sys.stderr.flush()
+                elif ftype == "RESPONSE":
+                    in_content = True
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+            continue
+
+        if path == "response/fragments/-1/elapsed_secs" and op == "SET":
+            thinking_done = True
+            in_think      = False
+            continue
+
+        if path == "response/fragments" and op == "APPEND":
+            thinking_done = True
+            frags = val if isinstance(val, list) else []
+            for frag in frags:
+                if not isinstance(frag, dict):
+                    continue
+                ftype   = frag.get("type", "")
+                content = frag.get("content", "")
+                if not content:
+                    continue
+                if ftype in ("THINK", "THINKING"):
+                    in_think = True
+                    sys.stderr.write(f"\033[2m{content}\033[0m")
+                    sys.stderr.flush()
+                else:
+                    in_think   = False
+                    in_content = True
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+            continue
+
+        if path == "response/fragments/-1/content" and op == "APPEND":
+            if thinking and not thinking_done:
+                in_think = True
+                sys.stderr.write(f"\033[2m{val}\033[0m")
+                sys.stderr.flush()
+            else:
+                in_think   = False
+                in_content = True
+                sys.stdout.write(val)
+                sys.stdout.flush()
+            continue
+
+        if not path and isinstance(val, str) and val:
+            if in_think:
+                sys.stderr.write(f"\033[2m{val}\033[0m")
+                sys.stderr.flush()
+            elif in_content:
+                sys.stdout.write(val)
+                sys.stdout.flush()
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    save_state({"session_id": session_id, "parent_message_id": response_msg_id, "model_type": model_type})
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="deepseek",
+        description="CLI para DeepSeek Chat",
+        add_help=True,
+    )
+    parser.add_argument("prompt", nargs="?", help="Mensaje a enviar (o lee de stdin)")
+    parser.add_argument("-s", "--new-session", action="store_true",
+                        help="Inicia nueva conversación")
+    parser.add_argument("--r1", action="store_true",
+                        help="Usa DeepSeek-R1 (thinking)")
+    parser.add_argument("--search", action="store_true",
+                        help="Activa búsqueda web")
+    parser.add_argument("--model", choices=["default", "expert", "vision"],
+                        default=None,
+                        help="Modelo: default (V3), expert (R1), vision")
+    parser.add_argument("--image", metavar="FILE", action="append", default=[],
+                        help="Adjunta imagen/archivo (puede repetirse). Activa vision automáticamente.")
+    parser.add_argument("--asr", metavar="FILE",
+                        help="Transcribe audio y usa el resultado como prompt (requiere ffmpeg + libopus)")
+    parser.add_argument("--no-training", action="store_true",
+                        help="Opt-out: tus conversaciones no se usan para entrenar el modelo")
+    parser.add_argument("--training-on", action="store_true",
+                        help="Reactiva el uso de tus conversaciones para entrenamiento")
+    parser.add_argument("--logout", action="store_true",
+                        help="Borra el token guardado")
+    args = parser.parse_args()
+
+    token        = get_token()
+    auth_headers = {**HEADERS, "Authorization": f"Bearer {token}"}
+
+    if args.logout:
+        for f in (TOKEN_FILE, SESSION_FILE):
+            if os.path.exists(f):
+                os.remove(f)
+        print("Sesión y token eliminados.", file=sys.stderr)
+        return
+
+    if args.no_training:
+        set_training(auth_headers, False)
+        if not args.prompt and not args.image:
+            return
+
+    if args.training_on:
+        set_training(auth_headers, True)
+        if not args.prompt and not args.image:
+            return
+
+    # ASR: transcribe audio → use as prompt
+    audio_id = None
+    asr_text  = None
+    if args.asr:
+        if not os.path.isfile(args.asr):
+            raise SystemExit(f"[!] Archivo de audio no encontrado: {args.asr}")
+        asr_text, audio_id = asr_transcribe(auth_headers, args.asr)
+        print(f"[+] Transcripción: {asr_text}", file=sys.stderr)
+
+    # Leer prompt
+    prompt = args.prompt
+    if not prompt and not asr_text:
+        if sys.stdin.isatty():
+            print("Escribe tu mensaje (Ctrl+D para enviar):", file=sys.stderr)
+        prompt = sys.stdin.read().strip()
+
+    # Combine ASR text with any typed prompt
+    if asr_text and prompt:
+        prompt = f"{asr_text}\n\n{prompt}"
+    elif asr_text:
+        prompt = asr_text
+
+    if not prompt:
+        parser.print_help()
+        sys.exit(1)
+
+    # Subir archivos adjuntos
+    file_ids = []
+    for path in args.image:
+        if not os.path.isfile(path):
+            raise SystemExit(f"[!] Archivo no encontrado: {path}")
+        # Determine model_type early for upload headers
+        upload_model = args.model or ("vision" if not args.r1 else None)
+        fid = upload_file(auth_headers, path, model_type=upload_model)
+        wait_for_file(auth_headers, fid)
+        file_ids.append(fid)
+
+    # Determinar modelo
+    model_type = args.model or ("expert" if args.r1 else None)
+    if file_ids and model_type is None:
+        model_type = "vision"   # auto-switch a vision cuando hay archivos
+    thinking = args.r1 or (model_type == "expert")
+
+    session_id, parent_message_id, saved_model = get_state(
+        auth_headers, new_session=args.new_session or bool(file_ids), model_type=model_type
+    )
+    if model_type is None:
+        model_type = saved_model
+
+    try:
+        chat(auth_headers, session_id, parent_message_id, prompt,
+             thinking=thinking, search=args.search, model_type=model_type,
+             file_ids=file_ids, audio_id=audio_id)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+services:
+  deepseek:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - TOKEN_REFRESH_INTERVAL=${TOKEN_REFRESH_INTERVAL:-21600}
+      # Credenciales — se leen desde el .env del host automáticamente por docker compose
+      - DEEPSEEK_EMAIL=${EMAIL}
+      - DEEPSEEK_PASSWORD=${PASSWORD}
+      - DEEPSEEK_TOKEN=${DEEPSEEK_TOKEN:-}
+    volumes:
+      # .env montado para que el watcher pueda escribir DEEPSEEK_TOKEN renovado
+      - ./.env:/app/.env
+      # Token file como caché adicional
+      - ~/.deepseek_token:/root/.deepseek_token
+    restart: unless-stopped
