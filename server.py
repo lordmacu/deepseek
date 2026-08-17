@@ -306,6 +306,16 @@ def _iter_content_chunks(ds_resp):
                     yield val
             continue
 
+        # Continuacion sin ruta: DeepSeek manda el PRIMER trozo con `p` explicito
+        # y los siguientes SIN `p` ni `o` — la ruta queda implicita (optimizacion
+        # de diff). Verificado contra el stream real: "1, 2, 3, 4, 5" llega como
+        # 1 evento con ruta + 17 sin ella. Ignorarlos truncaba la respuesta al
+        # primer fragmento ("1," en vez de la lista entera).
+        if not path and not op and isinstance(val, str):
+            if not in_think and val:
+                yield val
+            continue
+
         # Full snapshot event
         if not path and isinstance(val, dict) and "response" in val:
             for frag in val["response"].get("fragments", []):
