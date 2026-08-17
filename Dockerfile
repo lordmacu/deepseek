@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# ffmpeg + libopus (ASR); no Node.js needed — PoW solved via wasmer (Python)
+# ffmpeg + libopus (ASR); no Node.js needed — PoW solved via wasmtime (Python)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libopus0 \

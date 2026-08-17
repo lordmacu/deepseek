@@ -2,51 +2,57 @@
 """
 PoW solver — reads the challenge JSON from stdin, writes {"nonce": N, "prefix": P} to stdout.
 Usage: echo '{"challenge":...,"salt":...,"difficulty":...,"expire_at":...}' | python3 pow_solver.py
+
+Runtime: wasmtime. El paquete `wasmer` de PyPI esta abandonado y publica un stub que
+lanza ImportError("Wasmer is not available on this system") cuando no hay wheel para
+la plataforma/version de Python — pasa con Python 3.11, que es el del Dockerfile, asi
+que el solver fallaba DENTRO del contenedor y con el toda peticion de chat.
 """
 import sys, json, os, struct
-from wasmer import engine, Store, Module, Instance
-from wasmer_compiler_cranelift import Compiler
+from wasmtime import Engine, Store, Module, Instance
 
 WASM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sha3_wasm_bg.wasm")
 
-_instance = None
+_store = None
+_exports = None
 
-def _get_instance():
-    global _instance
-    if _instance is None:
-        store = Store(engine.JIT(Compiler))
-        with open(WASM_PATH, "rb") as f:
-            wasm_bytes = f.read()
-        module = Module(store, wasm_bytes)
-        _instance = Instance(module)
-    return _instance
 
-def _mem(inst):
-    return memoryview(inst.exports.memory.buffer)
+def _get():
+    global _store, _exports
+    if _exports is None:
+        engine = Engine()
+        _store = Store(engine)
+        module = Module.from_file(engine, WASM_PATH)
+        instance = Instance(_store, module, [])
+        _exports = instance.exports(_store)
+    return _store, _exports
 
-def _write_str(inst, s):
+
+def _write_str(store, exports, s):
     buf = s.encode("utf-8")
     n = len(buf)
-    ptr = inst.exports.__wbindgen_export_0(n + 1, 1)
-    m = _mem(inst)
-    m[ptr:ptr + n] = buf
-    m[ptr + n] = 0
+    ptr = exports["__wbindgen_export_0"](store, n + 1, 1)
+    mem = exports["memory"]
+    mem.write(store, buf, ptr)
+    mem.write(store, b"\x00", ptr + n)
     return ptr, n
 
+
 def solve(challenge, salt, expire_at, difficulty):
-    inst = _get_instance()
+    store, exports = _get()
     prefix = f"{salt}_{expire_at}_"
-    ret_ptr = inst.exports.__wbindgen_add_to_stack_pointer(-16)
-    ptr0, len0 = _write_str(inst, challenge)
-    ptr1, len1 = _write_str(inst, prefix)
-    inst.exports.wasm_solve(ret_ptr, ptr0, len0, ptr1, len1, float(difficulty))
-    m = _mem(inst)
-    status = struct.unpack_from("<i", m, ret_ptr)[0]
-    nonce  = struct.unpack_from("<d", m, ret_ptr + 8)[0]
-    inst.exports.__wbindgen_add_to_stack_pointer(16)
+    ret_ptr = exports["__wbindgen_add_to_stack_pointer"](store, -16)
+    ptr0, len0 = _write_str(store, exports, challenge)
+    ptr1, len1 = _write_str(store, exports, prefix)
+    exports["wasm_solve"](store, ret_ptr, ptr0, len0, ptr1, len1, float(difficulty))
+    raw = exports["memory"].read(store, ret_ptr, ret_ptr + 16)
+    status = struct.unpack_from("<i", raw, 0)[0]
+    nonce = struct.unpack_from("<d", raw, 8)[0]
+    exports["__wbindgen_add_to_stack_pointer"](store, 16)
     if status == 0:
         raise SystemExit("PoW solver: no solution found")
     return int(nonce), prefix
+
 
 if __name__ == "__main__":
     data = json.loads(sys.stdin.buffer.read())
