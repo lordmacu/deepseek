@@ -318,11 +318,18 @@ def _iter_content_chunks(ds_resp):
 
         # Full snapshot event
         if not path and isinstance(val, dict) and "response" in val:
-            for frag in val["response"].get("fragments", []):
+            frags = val["response"].get("fragments", [])
+            for frag in frags:
                 ftype   = frag.get("type", "")
                 content = frag.get("content", "")
                 if content and ftype not in ("THINK", "THINKING"):
                     yield content
+            # El snapshot ABRE el fragmento al que apuntan los APPEND siguientes,
+            # asi que tiene que dejar `in_think` en el estado correcto. Sin esto,
+            # deepseek-reasoner declaraba type='THINK' aca y despues filtraba todo
+            # su razonamiento al contenido (" need answer in Spanish? User asks...").
+            if frags:
+                in_think = frags[-1].get("type", "") in ("THINK", "THINKING")
 
 
 def _ds_completion(token: str, prompt: str, model_type: str, thinking: bool):
