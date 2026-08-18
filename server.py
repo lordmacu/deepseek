@@ -300,7 +300,23 @@ def _iter_content_chunks(ds_resp):
                     yield content
             continue
 
-        if path == "response/fragments/-1/content" and op == "APPEND":
+        # `op` vacio cuenta como APPEND: es la MISMA optimizacion de diff que
+        # los eventos sin ruta de mas abajo -- DeepSeek omite lo que se puede
+        # deducir. Verificado contra el stream real (2026-08-17, instrumentando
+        # el proxy en produccion) con deepseek-reasoner:
+        #
+        #   p='response/fragments'            o='APPEND'  -> fragmento con content='H'
+        #   p='response/fragments/-1/content' o=''        -> v='ola'
+        #
+        # Exigir op=="APPEND" dejaba ese segundo evento sin rama: tiene `p`, asi
+        # que tampoco entra en la continuacion sin ruta (`not path`), y se caia
+        # por el hueco entre las dos. "Hola mundo hermoso" salia como "H mundo
+        # hermoso" -- se perdia justo el primer trozo despues del pensamiento,
+        # que es donde el reasoner abre el fragmento de contenido.
+        #
+        # NO se acepta cualquier `op`: un "SET" futuro significaria REEMPLAZAR
+        # el contenido, no agregarlo, y tratarlo como append duplicaria texto.
+        if path == "response/fragments/-1/content" and op in ("APPEND", ""):
             if not in_think:
                 if val:
                     yield val

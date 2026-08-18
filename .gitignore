@@ -7,3 +7,4 @@ __pycache__/
 decompiled_apktool/
 decompiled_jadx/
 deepseek.apk
+venv/
