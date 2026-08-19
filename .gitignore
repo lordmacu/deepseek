@@ -8,3 +8,18 @@ decompiled_apktool/
 decompiled_jadx/
 deepseek.apk
 venv/
+
+# Reverse-engineering scratch: one-off probes written while working out
+# DeepSeek's PoW (the WASM calling convention, the hash algorithm) and manual
+# login/chat drivers. They are useful to keep around locally and are not part of
+# the service -- the Dockerfile ships only `deepseek pow_solver.py
+# sha3_wasm_bg.wasm server.py`, and nothing in the codebase imports any of
+# these. They were committed by accident in 6f12c27; ignoring them keeps that
+# from happening twice. Some hardcode absolute paths under /Users, which is the
+# clearest sign they were never meant to be shared.
+chat_test.py
+login_test.py
+solve_wasm.mjs
+wasm_hash.mjs
+wasm_verify.mjs
+wasm_verify2.mjs
