@@ -23,3 +23,12 @@ solve_wasm.mjs
 wasm_hash.mjs
 wasm_verify.mjs
 wasm_verify2.mjs
+
+# The manual toolkit's other half. `pow_solver.mjs` is the legacy Node solver,
+# superseded in production by pow_solver.py (which is what the `deepseek` CLI
+# actually calls, and what the image ships); the only thing still using the .mjs
+# is chat_test.py above, so the two belong together. `sha3_wasm.wat` is the
+# readable disassembly of sha3_wasm_bg.wasm -- reference material, imported by
+# nothing. Both remain in history from 0a57738 if ever needed again.
+pow_solver.mjs
+sha3_wasm.wat
