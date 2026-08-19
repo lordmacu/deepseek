@@ -254,10 +254,76 @@ def _format_messages(messages: list) -> str:
     return "\n".join(parts)
 
 
+class BusinessError(Exception):
+    """DeepSeek refused the request while still answering HTTP 200.
+
+    Captured live on 2026-08-19: with the anonymous account muted, the upstream
+    replies 200 with a JSON envelope instead of an SSE stream --
+
+        {"code":0,"msg":"","data":{"biz_code":5,"biz_msg":"user is muted",
+                                   "biz_data":{"is_muted":1,"mute_until":1787189717.413}}}
+
+    Nothing in that body starts with "data:", so the parser below simply found no
+    fragments and the endpoint returned 200 with content "". A refusal reaching
+    the caller as a successful empty answer is the worst possible shape for it:
+    the gateway in front of this proxy could not distinguish a muted account from
+    a model with nothing to say, so it kept sending traffic at an account that was
+    being punished for precisely that.
+    """
+
+    def __init__(self, message: str, retry_after_epoch: float | None = None):
+        super().__init__(message)
+        # Absolute epoch seconds, as DeepSeek reports it (`mute_until`), not a
+        # duration: converting it here would bake in the moment of parsing, and
+        # the caller is what knows when it is answering.
+        self.retry_after_epoch = retry_after_epoch
+
+
+def _business_error(raw: str) -> BusinessError | None:
+    """A BusinessError if this line is a refusal envelope, else None.
+
+    Only a line that is NOT an SSE event is considered -- a real stream line
+    starts with "data:" -- and only a NON-ZERO `biz_code` counts: the same
+    envelope shape carries `biz_code: 0` when everything is fine.
+    """
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None                      # keepalives, blank lines, anything else
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data.get("biz_code"):
+        return None
+    message = data.get("biz_msg") or f"biz_code {data.get('biz_code')}"
+    biz_data = data.get("biz_data")
+    until = biz_data.get("mute_until") if isinstance(biz_data, dict) else None
+    return BusinessError(message, until if isinstance(until, (int, float)) else None)
+
+
+def _retry_after_seconds(e: BusinessError) -> int | None:
+    """DeepSeek's absolute `mute_until` as a duration from now, never negative.
+
+    None when the refusal carried no deadline -- better no header at all than a
+    made-up one, which the caller would honour just as literally.
+    """
+    if e.retry_after_epoch is None:
+        return None
+    return max(0, int(e.retry_after_epoch - time.time()))
+
+
+def _retry_after_header(e: BusinessError) -> dict:
+    seconds = _retry_after_seconds(e)
+    return {} if seconds is None else {"Retry-After": str(seconds)}
+
+
 def _iter_content_chunks(ds_resp):
     """
     Generator that yields plaintext content chunks from a DeepSeek streaming
     response, skipping <think> fragments.
+
+    Raises BusinessError if the upstream refused the request in its body while
+    answering HTTP 200 -- see that class for why that is not merely cosmetic.
     """
     thinking_done = False
     in_think = False
@@ -265,6 +331,9 @@ def _iter_content_chunks(ds_resp):
     for line in ds_resp.iter_lines():
         raw = line.decode() if isinstance(line, bytes) else line
         if not raw.startswith("data:"):
+            refusal = _business_error(raw)
+            if refusal is not None:
+                raise refusal
             continue
         try:
             evt = json.loads(raw[5:])
@@ -487,9 +556,22 @@ async def chat_completions(request: Request, authorization: str = Header(default
             }
             yield f"data: {json.dumps(role_chunk)}\n\n"
 
-            for text in await loop.run_in_executor(
-                None, lambda: list(_iter_content_chunks(ds_resp))
-            ):
+            try:
+                texts = await loop.run_in_executor(
+                    None, lambda: list(_iter_content_chunks(ds_resp)))
+            except BusinessError as e:
+                # The 200 and the SSE headers went out before the body was read,
+                # so there is no status left to change: the refusal has to reach
+                # the client as an error EVENT. Silence here would look like a
+                # perfectly ordinary empty answer.
+                err = json.dumps({"error": {
+                    "message": f"DeepSeek refused the request: {e}",
+                    "type": "rate_limit_error",
+                    "retry_after": _retry_after_seconds(e)}})
+                yield f"data: {err}\n\n"
+                return
+
+            for text in texts:
                 chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
@@ -513,7 +595,16 @@ async def chat_completions(request: Request, authorization: str = Header(default
                 raise HTTPException(502, detail=f"DeepSeek error {ds_resp.status_code}")
             return "".join(_iter_content_chunks(ds_resp))
 
-        content = await loop.run_in_executor(None, _run)
+        try:
+            content = await loop.run_in_executor(None, _run)
+        except BusinessError as e:
+            # 429, not 502, and with Retry-After: a mute is a rate limit, and this
+            # is the one shape a client can act on precisely instead of guessing.
+            # Returning 200-with-empty-content (what this did before) made the
+            # caller keep hammering an account that was muted for exactly that.
+            raise HTTPException(
+                429, detail=f"DeepSeek refused the request: {e}",
+                headers=_retry_after_header(e))
 
         return JSONResponse({
             "id":      completion_id,
