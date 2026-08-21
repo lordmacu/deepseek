@@ -539,6 +539,32 @@ async def auth_login(body: LoginRequest):
     }
 
 
+# ── Capability gate (spec §3.4) ───────────────────────────────────────────────
+# These endpoints exist ONLY so a client trying them gets 501 rather than
+# FastAPI's generic 404. There is no implementation behind them, which is the
+# point -- `capabilities.require` raises, and its docstring says why not 404.
+
+@app.post("/v1/images/generations")
+def images_not_implemented():
+    capabilities.require("images")
+
+
+@app.post("/v1/audio/speech")
+def speech_not_implemented():
+    capabilities.require("audio_speech")
+
+
+@app.post("/v1/translate")
+def translate_not_implemented():
+    capabilities.require("translate")
+
+
+@app.api_route("/v1/files", methods=["GET", "POST"])
+@app.api_route("/v1/files/{file_id}", methods=["GET", "DELETE"])
+def files_not_implemented(file_id: str = ""):
+    capabilities.require("files")
+
+
 @app.get("/v1/conversations")
 def list_conversations(limit: int = 20, cursor: str | None = None):
     """List the conversations this proxy has served.
@@ -716,6 +742,8 @@ async def audio_transcriptions(
     response_format: str        = Form(default="json"),
     authorization:   str        = Header(default=None),
 ):
+    capabilities.require("audio_transcription")
+
     token  = _tokens.get(_bearer(authorization))
     auth_h = _auth_headers(token)
 

@@ -209,3 +209,46 @@ def test_without_a_database_the_contract_says_false(broken_store):
     import capabilities
     assert capabilities.effective(
         capabilities.SessionState(mode="account"))["conversations"] is False
+
+
+# ── El gate de §3.4 ───────────────────────────────────────────────────────────
+
+def test_a_false_capability_answers_501_not_404(store):
+    """404 es indistinguible de un error de ruteo, y 503 hace que el gateway
+    reintente algo que nunca iba a funcionar en esta configuración."""
+    from fastapi.testclient import TestClient
+    import server
+
+    client = TestClient(server.app)
+    for method, path in (("post", "/v1/images/generations"),
+                         ("post", "/v1/audio/speech"),
+                         ("post", "/v1/translate"),
+                         ("post", "/v1/files"),
+                         ("get", "/v1/files"),
+                         ("get", "/v1/files/abc"),
+                         ("delete", "/v1/files/abc")):
+        assert getattr(client, method)(path).status_code == 501, path
+
+
+def test_the_gate_names_the_capability_and_where_to_look(store):
+    from fastapi.testclient import TestClient
+    import server
+
+    detail = TestClient(server.app).post("/v1/translate").json()["detail"]
+    assert "translate" in detail and "/health" in detail
+
+
+def test_conversations_is_not_gated_off_when_history_works(store):
+    """Es la única capacidad acá que sigue a la base y no a las credenciales."""
+    import capabilities
+    capabilities.require("conversations")   # no raise
+
+
+def test_conversations_501s_when_history_cannot_be_stored(broken_store):
+    import capabilities
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    with _pytest.raises(HTTPException) as exc:
+        capabilities.require("conversations")
+    assert exc.value.status_code == 501
