@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # to be named on this COPY line too, or the container crash-loops on
 # ModuleNotFoundError with the port dark (has happened twice in this
 # codebase family, once in production).
-COPY deepseek pow_solver.py sha3_wasm_bg.wasm server.py capabilities.py ./
+COPY deepseek pow_solver.py sha3_wasm_bg.wasm server.py capabilities.py conversations.py ./
 
 RUN chmod +x /app/deepseek
 

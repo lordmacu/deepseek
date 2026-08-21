@@ -24,6 +24,7 @@ from pydantic import BaseModel
 import requests as _requests
 
 import capabilities
+import conversations as _conversations
 
 # Intervalo de validación del token en segundos (configurable por env).
 # El token de DeepSeek es opaco (no JWT), duración desconocida pero probablemente días.
@@ -537,6 +538,57 @@ async def auth_login(body: LoginRequest):
     }
 
 
+@app.get("/v1/conversations")
+def list_conversations(limit: int = 20, cursor: str | None = None):
+    """List the conversations this proxy has served.
+
+    Scope worth stating at the endpoint, not only in the docs: these are
+    conversations that went THROUGH this proxy. DeepSeek's backend stores no
+    conversation list at all -- its own Android client keeps one in a local
+    device database -- so nothing else could be listed here by any proxy.
+
+    Response shape matches mistral-proxy and perplexity-proxy so the gateway
+    reads one form for every provider.
+    """
+    if not _conversations.available():
+        raise HTTPException(
+            501, detail=f"history unavailable: {_conversations.unavailable_reason()}")
+    try:
+        offset = int(cursor) if cursor else 0
+        if offset < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, detail=f"invalid cursor: {cursor}")
+
+    limit = max(1, min(limit, 100))
+    items, more = _conversations.list_page(limit, offset)
+    return {"object": "list", "data": items,
+            "next_cursor": str(offset + limit) if more else None}
+
+
+@app.get("/v1/conversations/{conversation_id}")
+def get_conversation(conversation_id: str):
+    if not _conversations.available():
+        raise HTTPException(
+            501, detail=f"history unavailable: {_conversations.unavailable_reason()}")
+    item = _conversations.get(conversation_id)
+    if item is None:
+        raise HTTPException(404, detail=f"conversation not found: {conversation_id}")
+    return item
+
+
+@app.get("/v1/conversations/{conversation_id}/messages")
+def get_conversation_messages(conversation_id: str):
+    if not _conversations.available():
+        raise HTTPException(
+            501, detail=f"history unavailable: {_conversations.unavailable_reason()}")
+    messages = _conversations.messages_of(conversation_id)
+    if messages is None:
+        raise HTTPException(404, detail=f"conversation not found: {conversation_id}")
+    return {"object": "list", "conversation_id": conversation_id,
+            "data": messages, "next_cursor": None}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: str = Header(default=None)):
     token   = _tokens.get(_bearer(authorization))
@@ -552,6 +604,11 @@ async def chat_completions(request: Request, authorization: str = Header(default
     model_type = _MODEL_MAP.get(model, "default")
     thinking   = model_type == "expert"
     prompt     = _format_messages(messages)
+
+    # Resolved BEFORE the upstream call so a continuation is matched against the
+    # thread as the client sent it. Returns None when history is unavailable
+    # (no writable database), and every use below tolerates that.
+    conversation_id = _conversations.resolve(messages)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created       = int(time.time())
@@ -597,6 +654,8 @@ async def chat_completions(request: Request, authorization: str = Header(default
                 yield f"data: {err}\n\n"
                 return
 
+            _conversations.record(conversation_id, messages, "".join(texts))
+
             for text in texts:
                 chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
@@ -631,6 +690,8 @@ async def chat_completions(request: Request, authorization: str = Header(default
             raise HTTPException(
                 429, detail=f"DeepSeek refused the request: {e}",
                 headers=_retry_after_header(e))
+
+        _conversations.record(conversation_id, messages, content)
 
         return JSONResponse({
             "id":      completion_id,

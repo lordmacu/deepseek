@@ -59,7 +59,7 @@ día que un request real a DeepSeek falla; eso lo sigue manejando
 | `audio_speech` | ❌ | — | No existe la ruta `POST /v1/audio/speech`, y no hay ninguna llamada de texto-a-voz en `server.py` ni en el módulo `deepseek`. |
 | `translate` | ❌ | — | No existe la ruta `POST /v1/translate`. |
 | `files` | ❌ | `/api/v0/file/upload_file` (upstream — ver `deepseek:249 upload_file()`) | La RPC existe y funciona contra DeepSeek, pero `server.py` nunca la llama y no expone ninguna ruta `/v1/files*`. La capacidad existe en el vendor, no en este proxy. Se nombra acá el endpoint upstream a propósito, para que quien la exponga después no tenga que redescubrirlo. |
-| `conversations` | ❌ (siempre) | — | **El backend de DeepSeek no guarda la lista de conversaciones.** El cliente Android la mantiene en una base de datos local del dispositivo: `database.f("chat_session_list", ...)` en `decompiled_jadx/sources/defpackage/v6a.java`, sobre libWCDB. Enumeré las 37 rutas del API upstream en el decompilado: las únicas de sesión son `chat/history_messages` (reproduce **una** sesión cuyo id ya tenés), `chat_session/create` y `chat_session/delete_all` — ninguna lista. No es trabajo pendiente de este proxy: no hay nada del lado servidor que exponer. |
+| `conversations` | ✅ | base de datos escribible | **Historial local**, igual que el cliente oficial. El backend de DeepSeek no guarda ninguna lista — el cliente Android la mantiene en una base local del dispositivo (`database.f("chat_session_list", ...)`, `v6a.java`, libWCDB) y ninguna de las 37 rutas upstream enumera nada. Así que este proxy **es** el dispositivo: `conversations.py` guarda los turnos en SQLite al pasar. El booleano sigue a la base, no a las credenciales. Ver la sección de abajo. |
 
 Sin credenciales — ni variables de entorno ni token cacheado en
 `~/.deepseek_token` — las tres capacidades marcadas "✅ (con credenciales)"
@@ -96,6 +96,49 @@ todavía no cumple la letra de §3.4. Cerrar esto — añadir los cinco
 handlers gated, sin implementar la funcionalidad real detrás — es trabajo
 aparte, deliberadamente fuera del alcance de esta tarea: publicar el
 contrato no incluía exponer ni cerrar superficie nueva.
+
+## Conversaciones (`/v1/conversations`)
+
+**Historial local, y eso no es un parche.** DeepSeek no ofrece la lista del
+lado servidor: enumeré las 37 rutas del API en el cliente decompilado y ninguna
+lista nada. `chat/history_messages` reproduce **una** sesión cuyo id ya tenés;
+`chat_session/create` y `chat_session/delete_all` son las otras dos de sesión.
+El propio cliente Android resuelve esto con una base de datos local del
+dispositivo. Este proxy hace lo mismo — pasa a ser el dispositivo.
+
+**Qué es una conversación acá, y por qué no es una sesión de DeepSeek.**
+`server.py` crea una `chat_session` desechable por request y siempre manda
+`parent_message_id: None`, así que las sesiones de DeepSeek tienen un
+intercambio cada una: indexarlas daría miles de "conversaciones" de un mensaje.
+En cambio una conversación es el **hilo del cliente**, reconstruido como lo hace
+perplexity-proxy: un request cuyos mensajes previos coinciden con la cola
+guardada continúa esa conversación, y cualquier otro abre una nueva. Ese
+agrupamiento es lo que hace que el listado valga la pena.
+
+| Ruta | Qué devuelve |
+|---|---|
+| `GET /v1/conversations` | listado paginado, más reciente primero, con `next_cursor` |
+| `GET /v1/conversations/{id}` | metadata (título, fecha) |
+| `GET /v1/conversations/{id}/messages` | los turnos en orden |
+
+La forma de respuesta replica la de mistral-proxy y perplexity-proxy a
+propósito: el gateway debe leer una sola forma para los cinco.
+
+**Alcance, que hay que decir en voz alta:** esto lista lo que pasó **por este
+proxy**. Lo que hayas hablado en la app o el sitio de DeepSeek nunca tocó este
+proceso y no puede aparecer — el mismo límite que tiene el cliente Android en un
+segundo dispositivo.
+
+**Durabilidad — esto necesita una decisión de infraestructura.** La base es un
+archivo en `DEEPSEEK_DB_PATH` (por defecto `/app/data/conversations.db`). **Sin
+un volumen persistente montado en ese directorio, cada redeploy arranca con el
+historial vacío.** Por eso el booleano se calcula en vez de estar fijo: si la
+ruta no es escribible, `/health` reporta `conversations: false` y los endpoints
+responden `501`, en lugar de servir algo que se olvida todo calladamente.
+
+**Nunca puede tumbar una respuesta de chat.** `record()` se traga cualquier
+error: perder una entrada de historial es un daño menor que un 500 sobre una
+respuesta que el usuario ya recibió.
 
 ## `GET /health`
 

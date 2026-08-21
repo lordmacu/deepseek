@@ -37,6 +37,8 @@ X" for "a live call confirmed X".
 import os
 from dataclasses import dataclass
 
+import conversations as _conversations
+
 REQUIRED_CAPABILITIES = (
     "chat", "streaming", "tools", "vision", "images",
     "audio_speech", "audio_transcription", "translate",
@@ -184,18 +186,27 @@ def effective(state: SessionState) -> dict:
         `/api/v0/file/upload_file` upstream, but server.py never calls it
         and exposes no `/v1/files*` route -- the capability exists in the
         vendor, not in this proxy.
-      `conversations` -- False, and permanently so: DeepSeek's backend
-        does not store a conversation list. The Android client keeps it in
-        a device-local database -- `database.f("chat_session_list", ...)`
-        in `decompiled_jadx/sources/defpackage/v6a.java`, backed by
-        libWCDB -- so the list exists only on the device that created it.
-        The full upstream API surface was enumerated from the decompiled
-        client (37 paths); the only session-related ones are
-        `chat/history_messages`, which replays ONE session you already hold
-        the id of, `chat_session/create` and `chat_session/delete_all`.
-        None of them enumerate. No proxy can serve `/v1/conversations`
-        against this vendor, however well written -- the data is not on
-        the server to fetch.
+      `conversations` -- True when history is storable, and this is the
+        one boolean here that does not track credentials at all: it tracks
+        whether `conversations.py` can open its SQLite file.
+
+        The reason is worth keeping straight. DeepSeek's backend stores no
+        conversation list -- the Android client keeps one in a device-local
+        database (`database.f("chat_session_list", ...)` in
+        `decompiled_jadx/sources/defpackage/v6a.java`, libWCDB-backed), and
+        the full upstream surface (37 paths, enumerated from the decompiled
+        client) has nothing that enumerates. So this proxy does what the
+        official client does: it IS the device, and keeps the index itself.
+
+        That makes the scope narrower than the word suggests, which is why
+        it is written down rather than implied: `/v1/conversations` lists
+        what went THROUGH this proxy. Anything said in DeepSeek's own app
+        or website never touched this process and cannot appear.
+
+        And it is why the boolean is computed, not hardcoded: without a
+        writable path the endpoint would answer, forget everything on the
+        next redeploy, and look like it worked. Reporting False there is
+        the contract doing its job.
 
     None of the seven unconditional Falses above can be made True by an
     account gaining credentials -- each needs new code (spec 8, "what comes
@@ -214,5 +225,5 @@ def effective(state: SessionState) -> dict:
         "translate":           False,
         "search":              False,
         "files":               False,
-        "conversations":       False,
+        "conversations":       _conversations.available(),
     }
