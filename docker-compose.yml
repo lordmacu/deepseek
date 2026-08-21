@@ -1,18 +1,39 @@
+# El volumen vive ACÁ, en el repo, a propósito.
+#
+# Con el build pack `dockerfile` de Coolify, la persistencia era configuración
+# de la aplicación: alguien tenía que crearla a mano una vez por app, y se
+# perdía si la app se recreaba. `VOLUME /app/data` en el Dockerfile tampoco
+# sirve — Docker crea un volumen ANÓNIMO nuevo por contenedor, así que
+# documenta la intención pero no persiste nada entre despliegues.
+#
+# Declarado como volumen nombrado en este archivo, en cambio, existe solo por
+# desplegar el repo: en Coolify, en una máquina cualquiera con `docker compose
+# up`, o en la próxima vez que alguien recree la app. No depende de que nadie
+# se acuerde.
 services:
   deepseek:
     build: .
     ports:
-      - "8000:8000"
+      - "8892:8000"
     environment:
       - PORT=8000
       - TOKEN_REFRESH_INTERVAL=${TOKEN_REFRESH_INTERVAL:-21600}
-      # Credenciales — se leen desde el .env del host automáticamente por docker compose
-      - DEEPSEEK_EMAIL=${EMAIL}
-      - DEEPSEEK_PASSWORD=${PASSWORD}
+      - DEEPSEEK_EMAIL=${DEEPSEEK_EMAIL:-}
+      - DEEPSEEK_PASSWORD=${DEEPSEEK_PASSWORD:-}
       - DEEPSEEK_TOKEN=${DEEPSEEK_TOKEN:-}
+      # Historial de conversaciones. Sobre el volumen, no sobre la capa
+      # efímera: un redeploy lo borraba entero (verificado en producción).
+      - DEEPSEEK_DB_PATH=/app/data/conversations.db
     volumes:
-      # .env montado para que el watcher pueda escribir DEEPSEEK_TOKEN renovado
-      - ./.env:/app/.env
-      # Token file como caché adicional
-      - ~/.deepseek_token:/root/.deepseek_token
+      - deepseek-data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  deepseek-data:
