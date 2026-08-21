@@ -554,6 +554,17 @@ def speech_not_implemented():
     capabilities.require("audio_speech")
 
 
+@app.get("/v1/audio/voices")
+def voices_not_implemented():
+    """501, for the same reason /v1/audio/speech is: this proxy has no TTS.
+
+    The route exists so the audio surface is the same shape across the five
+    proxies -- a client can ask every one of them the same question and get an
+    answer it can act on, instead of a 404 here and a body there.
+    """
+    capabilities.require("audio_speech")
+
+
 @app.post("/v1/translate")
 def translate_not_implemented():
     capabilities.require("translate")

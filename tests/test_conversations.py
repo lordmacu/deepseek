@@ -222,6 +222,7 @@ def test_a_false_capability_answers_501_not_404(store):
     client = TestClient(server.app)
     for method, path in (("post", "/v1/images/generations"),
                          ("post", "/v1/audio/speech"),
+                         ("get", "/v1/audio/voices"),
                          ("post", "/v1/translate"),
                          ("post", "/v1/files"),
                          ("get", "/v1/files"),
