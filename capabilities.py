@@ -17,10 +17,15 @@ Unlike chatgpt-proxy, deepseek sells no tiers: one account, one set of
 credentials, no plan to resolve. So `snapshot()` follows grok-proxy's shape in
 spirit -- no lock, no vendor call, no refresh-interval cache like
 chatgpt-proxy's AccountState, which exists only because that account has paid
-plans worth polling. It reads one more local source than grok's single env
-var, though: deepseek's credentials can also live in a token file that
-persists across a redeploy, which grok has no equivalent of. See `snapshot()`
-for why that difference matters and stays a local read, never a vendor call.
+plans worth polling. It checks more local places than grok does, though:
+`DEEPSEEK_EMAIL`/`DEEPSEEK_PASSWORD`, plus -- via `_ds.load_token()`, the same
+function server.py itself uses -- three more: the `DEEPSEEK_TOKEN` env var,
+`.env`'s own `DEEPSEEK_TOKEN` key, and `~/.deepseek_token`. Grok's equivalent
+checks exactly one env var and has no persistent file cache to fall behind
+it; deepseek does, because credentials here can be refreshed on disk while
+the container keeps running (see `snapshot()`'s docstring for why that
+distinction is load-bearing, not decorative). All of it stays a local read,
+never a vendor call.
 
 IMPORTANT, and different from grok/chatgpt: nothing in this module was
 exercised against a live DeepSeek backend as part of writing it. Every value
@@ -179,8 +184,14 @@ def effective(state: SessionState) -> dict:
         `/api/v0/file/upload_file` upstream, but server.py never calls it
         and exposes no `/v1/files*` route -- the capability exists in the
         vendor, not in this proxy.
-      `conversations` -- False. `/api/v0/chat/history_messages` is real
-        upstream, but server.py exposes no `/v1/conversations*` route.
+      `conversations` -- False. server.py exposes no `/v1/conversations*`
+        route. `/api/v0/chat/history_messages` is the endpoint named for
+        this capability in this task's own brief; it was NOT independently
+        confirmed against the `deepseek` CLI module or the decompiled APK in
+        this repo (unlike `files`, whose `/api/v0/file/upload_file` is real
+        and callable at `deepseek:249 upload_file()`) -- so treat that
+        specific path as reported, not verified, until someone checks it
+        against a live account or the client's own protocol.
 
     None of the seven unconditional Falses above can be made True by an
     account gaining credentials -- each needs new code (spec 8, "what comes

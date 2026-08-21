@@ -32,19 +32,42 @@ ACCOUNT   = capabilities.SessionState(mode="account")
 
 @pytest.fixture
 def no_local_credentials(monkeypatch, tmp_path):
-    """Neutralizes every local source snapshot() reads: the env vars AND the
-    persisted token file (_ds.load_token()'s last fallback).
+    """Neutralizes every local source snapshot() reads.
 
-    This dev machine has a real ~/.deepseek_token from actual CLI use --
-    without repointing TOKEN_FILE too, tests asserting "anonymous" would
-    silently flip to "account" depending on what happens to exist on whatever
-    box runs this suite. Returns the (not-yet-existing) path so a test that
-    wants the "a cached token alone" case can just write to it.
+    snapshot() checks DEEPSEEK_EMAIL/PASSWORD directly, plus whatever
+    _ds.load_token() (deepseek:85-96) finds. That function resolves, IN
+    ORDER, exactly three places a token can be cached locally:
+
+        1. the DEEPSEEK_TOKEN env var                    (delenv, below)
+        2. .env's own DEEPSEEK_TOKEN key, via _ds.ENV_FILE   (repointed, below)
+        3. ~/.deepseek_token, via _ds.TOKEN_FILE             (repointed, below)
+
+    All three have to be neutralized, not just the first and third: this
+    repo's own .env carries a DEEPSEEK_TOKEN key that happens to be empty
+    right now, but save_token() (deepseek:99-104) writes a fresh one there on
+    every real login or token refresh -- so the next time someone runs the
+    CLI or the proxy re-authenticates on this machine, source 2 stops being
+    empty, and any "anonymous" assertion that only cleared 1 and 3 would
+    start silently reporting "account" instead. (This was caught in review:
+    an earlier version of this fixture repointed TOKEN_FILE but not
+    ENV_FILE, and every "anonymous" test here passed only because that .env
+    key happened to be blank.)
+
+    If `_ds.load_token()` ever grows a fourth local source, it has to be
+    added to the list above AND neutralized below, or it slips through
+    exactly the same way source 2 did.
+
+    Returns the (not-yet-existing) TOKEN_FILE path so a test that wants "a
+    cached token in the file alone" can just write to it; `capabilities._ds`
+    is available directly for a test that wants the ENV_FILE path instead
+    (see test_snapshot_reports_account_from_a_dot_env_token_alone below).
     """
     monkeypatch.delenv("DEEPSEEK_EMAIL", raising=False)
     monkeypatch.delenv("DEEPSEEK_PASSWORD", raising=False)
-    monkeypatch.delenv("DEEPSEEK_TOKEN", raising=False)
-    token_file = tmp_path / "no-such-token-file"
+    monkeypatch.delenv("DEEPSEEK_TOKEN", raising=False)                 # source 1
+    monkeypatch.setattr(capabilities._ds, "ENV_FILE",                   # source 2
+                         str(tmp_path / "no-such-.env"))
+    token_file = tmp_path / "no-such-token-file"                        # source 3
     monkeypatch.setattr(capabilities._ds, "TOKEN_FILE", str(token_file))
     return token_file
 
@@ -106,6 +129,19 @@ def test_snapshot_reports_account_from_a_persisted_token_file_alone(no_local_cre
     credentials out of the environment but keeps that mounted file must still
     report account -- the proxy is still serving those requests fine."""
     no_local_credentials.write_text("a-real-looking-cached-token")
+    assert capabilities.snapshot().mode == "account"
+
+
+def test_snapshot_reports_account_from_a_dot_env_token_alone(no_local_credentials):
+    """The third of load_token()'s three local sources (deepseek:85-96), and
+    the one a prior version of `no_local_credentials` left uncovered: a
+    DEEPSEEK_TOKEN key written straight into .env rather than exported as an
+    env var. save_token() (deepseek:99-104) writes here on every real login
+    or refresh -- this repo's own .env carries that key, empty today. Without
+    the fixture repointing _ds.ENV_FILE, this test (and every "anonymous"
+    one) would read this repo's real .env instead of the isolated one."""
+    with open(capabilities._ds.ENV_FILE, "w") as f:
+        f.write("DEEPSEEK_TOKEN=a-token-written-by-save_token\n")
     assert capabilities.snapshot().mode == "account"
 
 
