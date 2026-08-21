@@ -184,14 +184,18 @@ def effective(state: SessionState) -> dict:
         `/api/v0/file/upload_file` upstream, but server.py never calls it
         and exposes no `/v1/files*` route -- the capability exists in the
         vendor, not in this proxy.
-      `conversations` -- False. server.py exposes no `/v1/conversations*`
-        route. `/api/v0/chat/history_messages` is the endpoint named for
-        this capability in this task's own brief; it was NOT independently
-        confirmed against the `deepseek` CLI module or the decompiled APK in
-        this repo (unlike `files`, whose `/api/v0/file/upload_file` is real
-        and callable at `deepseek:249 upload_file()`) -- so treat that
-        specific path as reported, not verified, until someone checks it
-        against a live account or the client's own protocol.
+      `conversations` -- False, and permanently so: DeepSeek's backend
+        does not store a conversation list. The Android client keeps it in
+        a device-local database -- `database.f("chat_session_list", ...)`
+        in `decompiled_jadx/sources/defpackage/v6a.java`, backed by
+        libWCDB -- so the list exists only on the device that created it.
+        The full upstream API surface was enumerated from the decompiled
+        client (37 paths); the only session-related ones are
+        `chat/history_messages`, which replays ONE session you already hold
+        the id of, `chat_session/create` and `chat_session/delete_all`.
+        None of them enumerate. No proxy can serve `/v1/conversations`
+        against this vendor, however well written -- the data is not on
+        the server to fetch.
 
     None of the seven unconditional Falses above can be made True by an
     account gaining credentials -- each needs new code (spec 8, "what comes
