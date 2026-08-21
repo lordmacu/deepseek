@@ -150,57 +150,67 @@ def _title_from(messages: list) -> str:
 
 
 def resolve(messages: list) -> Optional[str]:
-    """Find the conversation this request continues, or start a new one.
+    """Find the conversation this request continues, if any.
 
     The lookup is on the messages BEFORE the new one: a request carrying
     [Q1, A1, Q2] continues the conversation whose stored tail is [Q1, A1].
-    A first turn has no prior messages and therefore always opens a new
-    conversation, which is correct -- two clients independently asking the same
-    first question are not in the same conversation.
+
+    Returns None for a first turn, and that is not a failure -- it means "no
+    conversation yet". Creation happens in `record()`, AFTER the upstream call
+    succeeded. Creating here instead would leave a titled, empty conversation
+    behind every request DeepSeek refused, and refusals are common enough on
+    this backend to fill the listing with them.
+
+    None is also what an unusable database returns. The two cases do not need
+    telling apart: `record()` no-ops without a database anyway.
     """
     if not messages:
+        return None
+    prior = messages[:-1]
+    if not prior:
         return None
     with _lock:
         conn = _connect()
         if conn is None:
             return None
-
-        prior = messages[:-1]
-        if prior:
-            row = conn.execute(
-                "SELECT id FROM conversations WHERE tail_key = ? ORDER BY updated_at DESC LIMIT 1",
-                (_key(prior),),
-            ).fetchone()
-            if row:
-                return row[0]
-
-        now = time.time()
-        conversation_id = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO conversations (id, title, tail_key, created_at, updated_at)"
-            " VALUES (?, ?, NULL, ?, ?)",
-            (conversation_id, _title_from(messages), now, now),
-        )
-        conn.commit()
-        return conversation_id
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE tail_key = ? ORDER BY updated_at DESC LIMIT 1",
+            (_key(prior),),
+        ).fetchone()
+    return row[0] if row else None
 
 
-def record(conversation_id: Optional[str], messages: list, answer: str) -> None:
+def record(conversation_id: Optional[str], messages: list, answer: str) -> Optional[str]:
     """Store the turn that just completed and move the conversation's tail.
+
+    Returns the conversation id -- the one passed in, or the one created for a
+    first turn -- so a caller that needs it does not have to look it up again.
+    None means nothing was stored.
 
     Written to be unable to break a chat response: every failure is swallowed.
     A lost history entry is a smaller harm than a 500 on an answer the user
     already received, and the caller runs this AFTER the upstream call has
     succeeded.
     """
-    if not conversation_id or not messages:
-        return
+    if not messages:
+        return None
     try:
         with _lock:
             conn = _connect()
             if conn is None:
-                return
+                return None
             now = time.time()
+
+            # A first turn arrives with no id: the conversation is born here,
+            # once there is an answer worth keeping.
+            if not conversation_id:
+                conversation_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO conversations (id, title, tail_key, created_at, updated_at)"
+                    " VALUES (?, ?, NULL, ?, ?)",
+                    (conversation_id, _title_from(messages), now, now),
+                )
+
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM messages WHERE conversation_id = ?",
                 (conversation_id,),
@@ -236,8 +246,9 @@ def record(conversation_id: Optional[str], messages: list, answer: str) -> None:
                 (_key(tail), now, conversation_id),
             )
             conn.commit()
+            return conversation_id
     except Exception:
-        return
+        return None
 
 
 def _iso(value: float) -> str:
@@ -302,3 +313,27 @@ def messages_of(conversation_id: str) -> Optional[list[dict]]:
             (conversation_id,),
         ).fetchall()
     return [{"role": r[0], "content": r[1], "id": None} for r in rows]
+
+
+def info() -> dict:
+    """Informational history status for `/health` -- NOT part of the contract.
+
+    `conversations: true` says the database can be opened, which is not the
+    same as saying it will still be there tomorrow: inside a container
+    `/app/data` is writable whether or not a volume is mounted on it. Nothing
+    a process can read distinguishes those two reliably, so instead of
+    guessing, this reports what an operator can act on -- where the file is and
+    how much is in it. A count that resets to zero after a deploy is a missing
+    volume, stated plainly enough to notice.
+    """
+    with _lock:
+        conn = _connect()
+        if conn is None:
+            return {"path": DB_PATH, "available": False, "reason": _broken,
+                    "conversations": 0}
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        except Exception:
+            count = 0
+    return {"path": DB_PATH, "available": True, "reason": None,
+            "conversations": count}

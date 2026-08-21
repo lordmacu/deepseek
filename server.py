@@ -483,6 +483,7 @@ def health():
         "contract":     1,
         "provider":     "deepseek",
         "auth":         capabilities.auth_block(state),
+        "history":      _conversations.info(),
         "capabilities": capabilities.effective(state),
     }
 

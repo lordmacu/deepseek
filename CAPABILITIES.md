@@ -136,6 +136,26 @@ historial vacío.** Por eso el booleano se calcula en vez de estar fijo: si la
 ruta no es escribible, `/health` reporta `conversations: false` y los endpoints
 responden `501`, en lugar de servir algo que se olvida todo calladamente.
 
+**El booleano NO prueba durabilidad, y hay que saberlo.** Dentro de un
+contenedor `/app/data` es escribible haya o no un volumen montado encima, así
+que `conversations: true` significa "se puede guardar", no "va a seguir ahí
+mañana". Nada que pueda leer el proceso distingue los dos casos de forma
+confiable. Por eso `/health` trae además un bloque **informativo** `history`
+—fuera de `capabilities`— con la ruta del archivo y cuántas conversaciones hay:
+
+```json
+"history": {"path": "/app/data/conversations.db", "available": true,
+            "reason": null, "conversations": 42}
+```
+
+Un contador que vuelve a cero después de un deploy es exactamente eso: falta el
+volumen.
+
+**Una conversación nace con su primera respuesta, no con la petición.** `resolve()`
+solo busca; `record()` crea. Si creara `resolve()`, cada petición que DeepSeek
+rechaza —y los rechazos acá son frecuentes— dejaría una conversación con título
+y sin mensajes en el listado.
+
 **Nunca puede tumbar una respuesta de chat.** `record()` se traga cualquier
 error: perder una entrada de historial es un daño menor que un 500 sobre una
 respuesta que el usuario ya recibió.
