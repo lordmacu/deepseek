@@ -23,6 +23,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests as _requests
 
+import capabilities
+
 # Intervalo de validación del token en segundos (configurable por env).
 # El token de DeepSeek es opaco (no JWT), duración desconocida pero probablemente días.
 # La estrategia real de renovación es reactiva: si un request devuelve 401, se renueva
@@ -166,7 +168,9 @@ async def lifespan(app: FastAPI):
 
 
 # ── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepSeek OpenAI API", version="1.0.0", lifespan=lifespan)
+APP_VERSION = "1.0.0"
+
+app = FastAPI(title="DeepSeek OpenAI API", version=APP_VERSION, lifespan=lifespan)
 
 # Model → DeepSeek model_type mapping
 _MODEL_MAP: dict[str, str] = {
@@ -458,6 +462,28 @@ def _ds_completion(token: str, prompt: str, model_type: str, thinking: bool):
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "deepseek-openai-proxy"}
+
+
+@app.get("/health")
+def health():
+    """The proxy capability contract (llm-libre spec 2026-08-20).
+
+    Unauthenticated and vendor-call-free on purpose (spec 3.1): this is the
+    gateway's health-sweep target and the container's own health check, and
+    both must answer even when DeepSeek itself is unreachable. `capabilities`
+    is EFFECTIVE -- what a request would achieve right now, not what this
+    codebase implements -- so the gateway reads one boolean instead of
+    learning what a DeepSeek session is. See capabilities.py.
+    """
+    state = capabilities.snapshot()
+    return {
+        "status":       "ok",
+        "version":      APP_VERSION,
+        "contract":     1,
+        "provider":     "deepseek",
+        "auth":         capabilities.auth_block(state),
+        "capabilities": capabilities.effective(state),
+    }
 
 
 @app.get("/v1/models")

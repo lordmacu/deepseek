@@ -13,7 +13,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App — sha3_wasm_bg.wasm cargado por pow_solver.py en runtime
-COPY deepseek pow_solver.py sha3_wasm_bg.wasm server.py ./
+# NOTE: adding a module to the codebase does not add it to the image — it has
+# to be named on this COPY line too, or the container crash-loops on
+# ModuleNotFoundError with the port dark (has happened twice in this
+# codebase family, once in production).
+COPY deepseek pow_solver.py sha3_wasm_bg.wasm server.py capabilities.py ./
 
 RUN chmod +x /app/deepseek
 
