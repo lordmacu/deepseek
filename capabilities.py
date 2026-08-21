@@ -14,10 +14,13 @@ durability -- if a fresh request tomorrow would still be refused for the same
 reason, it belongs in the boolean.
 
 Unlike chatgpt-proxy, deepseek sells no tiers: one account, one set of
-credentials, no plan to resolve. So `snapshot()` mirrors grok-proxy's shape --
-a single environment read, no cache, no lock, no vendor call -- rather than
-chatgpt-proxy's refresh-interval AccountState cache, which exists only
-because that account has paid plans worth polling.
+credentials, no plan to resolve. So `snapshot()` follows grok-proxy's shape in
+spirit -- no lock, no vendor call, no refresh-interval cache like
+chatgpt-proxy's AccountState, which exists only because that account has paid
+plans worth polling. It reads one more local source than grok's single env
+var, though: deepseek's credentials can also live in a token file that
+persists across a redeploy, which grok has no equivalent of. See `snapshot()`
+for why that difference matters and stays a local read, never a vendor call.
 
 IMPORTANT, and different from grok/chatgpt: nothing in this module was
 exercised against a live DeepSeek backend as part of writing it. Every value
@@ -41,42 +44,75 @@ class SessionState:
     mode: str          # "account" | "anonymous"
 
 
+# ── Reusing the `deepseek` CLI module's own token resolution ─────────────────
+# server.py loads this same file the same way (SourceFileLoader, because it has
+# no .py extension) to get its `_ds`; duplicated here rather than imported from
+# server.py to avoid a circular import (server.py imports capabilities, not the
+# other way round). The only thing this module borrows from it is
+# `load_token()` -- a pure local read (env var -> `.env` file ->
+# `~/.deepseek_token`, no network -- see that function's own body) -- so
+# `snapshot()` can see a persisted token the same way server.py would, without
+# re-deriving "~/.deepseek_token" by hand and risking it drifting from the real
+# constant (`deepseek`'s own `TOKEN_FILE`).
+import importlib.machinery
+import importlib.util
+
+_CLI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek")
+_loader   = importlib.machinery.SourceFileLoader("ds_capabilities", _CLI_PATH)
+_spec     = importlib.util.spec_from_loader("ds_capabilities", _loader)
+_ds       = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_ds)
+
+
 def snapshot() -> SessionState:
     """Whether this process holds something that should let it authenticate.
 
     server.py's own notion of "authenticated" (`_TokenManager.get`, deepseek
-    CLI module) is layered: a cached in-memory token, then a token loaded
-    from `DEEPSEEK_TOKEN`/`.env`/`~/.deepseek_token` and validated with a live
-    call to `/api/v0/users/current`, then auto-login with
-    `DEEPSEEK_EMAIL`/`DEEPSEEK_PASSWORD` (`_ds.login`, another live call). The
-    validating and login steps both reach the vendor, so none of that layer
-    can run here -- `/health` must answer without a vendor call (spec 3.1).
+    CLI module) is layered: a cached in-memory token, then a token loaded via
+    `_ds.load_token()` and validated with a live call to
+    `/api/v0/users/current`, then auto-login with `DEEPSEEK_EMAIL`/
+    `DEEPSEEK_PASSWORD` (`_ds.login`, another live call). The validating and
+    login steps both reach the vendor, so neither can run here -- `/health`
+    must answer without a vendor call (spec 3.1).
 
-    What CAN be read without one, and what this function reads, is exactly
-    the three environment variables this repo's own docker-compose.yml
-    injects into every container (see `environment:` there):
-    `DEEPSEEK_EMAIL`, `DEEPSEEK_PASSWORD` (what `_auto_login` needs) and
-    `DEEPSEEK_TOKEN` (a pre-obtained token that lets `_TokenManager` skip
-    login entirely). "account" means this process holds one of those two
-    credential shapes -- PRESENCE, not verified validity, the same
-    evidentiary class as grok-proxy's `GROK_SESSION_TOKEN` check: a token
-    that has since been revoked is only caught the day a real request to
-    DeepSeek fails, not here.
+    What CAN be read without one is credential PRESENCE, not verified
+    validity -- the same evidentiary class as grok-proxy's
+    `GROK_SESSION_TOKEN` check: a token that has since been revoked is only
+    caught the day a real request to DeepSeek fails, not here. Two sources
+    count as "account":
 
-    Deliberately NOT read: the mounted `.env` file's own EMAIL/PASSWORD/
-    DEEPSEEK_TOKEN keys and `~/.deepseek_token` (the file-based fallbacks
-    `_ds._env_creds`/`_ds.load_token` use when the matching env var is
-    unset). In the actual deployment all three values are also exported as
-    OS env vars by docker-compose, so this is not a gap there; it would only
-    diverge from server.py's own resolution for a bare `python server.py`
-    run with credentials placed exclusively in `.env` and never exported --
-    a configuration this repo's own docker-compose.yml does not use.
+      1. `DEEPSEEK_EMAIL` + `DEEPSEEK_PASSWORD` env vars -- what
+         `_auto_login` needs, read directly. These match two of the three
+         vars this repo's own docker-compose.yml injects into every
+         container.
+      2. `_ds.load_token()` returning a non-empty token -- reused rather
+         than re-derived. This is the source grok's equivalent check never
+         needed: grok has exactly one token in exactly one env var and no
+         persistent cache to fall behind it. deepseek is different --
+         docker-compose.yml mounts `~/.deepseek_token` into the container
+         ("Token file como caché adicional"), and both `_TokenManager`'s
+         in-memory refresh and the `deepseek` CLI's `save_token()` write a
+         freshly-renewed token to that file WHILE THE CONTAINER RUNS, never
+         into `os.environ` (fixed at container start). So a redeploy that
+         rotates credentials out of the environment but keeps that mounted
+         file would leave `os.environ` empty while the proxy keeps serving
+         requests off the cached token -- checking only env vars would
+         report `anonymous` for a proxy that is demonstrably `account`,
+         which is the contract lying in the unsafe direction: the gateway
+         would route away from a provider that works. `_ds.load_token()`
+         itself is a plain local read (env var, then the `.env` file's
+         `DEEPSEEK_TOKEN` key, then a stat-and-read of
+         `~/.deepseek_token`) -- no network, so it fits `/health`'s
+         constraint exactly. Only presence is checked here; the token's
+         contents are never inspected or validated -- that stays server.py's
+         job, the day a real request either succeeds or gets a 401.
     """
     email    = (os.environ.get("DEEPSEEK_EMAIL") or "").strip()
     password = (os.environ.get("DEEPSEEK_PASSWORD") or "").strip()
-    token    = (os.environ.get("DEEPSEEK_TOKEN") or "").strip()
-    has_credentials = bool(email and password) or bool(token)
-    return SessionState(mode="account" if has_credentials else "anonymous")
+    has_env_credentials = bool(email and password)
+    has_cached_token    = bool(_ds.load_token())
+    mode = "account" if (has_env_credentials or has_cached_token) else "anonymous"
+    return SessionState(mode=mode)
 
 
 def auth_block(state: SessionState) -> dict:
@@ -104,19 +140,19 @@ def effective(state: SessionState) -> dict:
     contract exists to prevent.
 
       `chat` -- True when live. `POST /v1/chat/completions` exists
-        (server.py:514) and resolves a DeepSeek token via `_tokens.get`
+        (server.py:541) and resolves a DeepSeek token via `_tokens.get`
         before doing anything else, so an unauthenticated process cannot
         make it succeed.
       `streaming` -- True when live. The same endpoint honours
         `stream: true` with a real SSE response, `data: [DONE]` terminated
-        (server.py:535-589).
+        (server.py:561-615).
       `audio_transcription` -- True when live. `POST /v1/audio/transcriptions`
-        exists (server.py:623), backed by `_ds.asr_transcribe` over
+        exists (server.py:650), backed by `_ds.asr_transcribe` over
         `/api/v0/asr/ws` (the `deepseek` module), and resolves a token the
         same way `chat` does.
 
       `tools` -- False ALWAYS, live or not. This proxy has no function
-        calling of its own: `_format_messages` (server.py:223-254) flattens
+        calling of its own: `_format_messages` (server.py:227-258) flattens
         the conversation into one prompt string, and nothing in
         `_iter_content_chunks` ever produces a `tool_calls` field. The
         GATEWAY emulates tool calling on top of this proxy's plain chat
@@ -126,12 +162,12 @@ def effective(state: SessionState) -> dict:
         deepseek's.
       `search` -- False ALWAYS, live or not. `_ds_completion` hardcodes
         `"search_enabled": False` in every completion payload it sends
-        (server.py:437). The backend supports search; a request sent
+        (server.py:441). The backend supports search; a request sent
         through THIS proxy right now never triggers it, credentials or not.
         The boolean reports what a request achieves, not what the vendor's
         backend is capable of (spec 3.2) -- so it stays False until
         server.py actually flips that field.
-      `vision` -- False. `_extract_text` (server.py:211-220) reads only
+      `vision` -- False. `_extract_text` (server.py:215-224) reads only
         content parts with `type == "text"`; an `image_url` part is
         silently dropped before it ever reaches the model.
       `images` -- False. No `/v1/images/generations` route exists.
